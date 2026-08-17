@@ -1,10 +1,39 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .config import settings
 from .context_budget import ContextBudgetManager
+from .utils import cap_query, join_nonempty
 from .zep_common import prime_eval_thread, render_graph_search
+
+
+def _clean_long_term_context(context_block: str, fact_text: str) -> str:
+    """Format and prioritize long-term context components so salient facts
+    and entity codes are preserved under tight budget limits.
+    """
+    parts: list[str] = []
+
+    # 1. User profile summary (contains core preferences and project mappings)
+    summary_match = re.search(r"(<USER_SUMMARY>.*?</USER_SUMMARY>)", context_block, re.DOTALL)
+    if summary_match:
+        parts.append(summary_match.group(1).strip())
+
+    # 2. Entity summaries (contains literal task and project markers)
+    entities_match = re.search(r"(<ENTITIES>.*?</ENTITIES>)", context_block, re.DOTALL)
+    if entities_match:
+        parts.append(entities_match.group(1).strip())
+
+    # 3. Verified edge facts from search (with temporal validity ranges)
+    if fact_text:
+        parts.append(fact_text)
+
+    # 4. Fallback: if no user summary or entities were parsed, use raw context block
+    if not parts:
+        return join_nonempty([fact_text, context_block], sep="\n\n")
+
+    return join_nonempty(parts, sep="\n\n")
 
 
 class StudentMemory:
@@ -19,34 +48,98 @@ class StudentMemory:
     # `cap_query(query)` (see src/utils.py) before passing it to graph.search.
 
     def retrieve_long_term(self, user_id: str, thread_id: str, query: str) -> str:
-        # LAB TODO 1/4
-        # 1) prime_eval_thread(...) has already been provided as scaffolding.
-        # 2) call thread.get_user_context(thread_id=...)
-        # 3) return the .context string.
-        # Bonus: append graph.search(scope="edges", limit>=20) facts with
-        #        validity ranges (a low limit can miss deadline/open-loop facts).
+        # 1) Prime evaluation thread with current user and query
         prime_eval_thread(self.client, user_id, thread_id, query)
-        raise NotImplementedError("LAB TODO: implement long-term retrieval with Zep Context Block")
+
+        # 2) Get Context Block for the evaluation thread
+        user_context = self.client.thread.get_user_context(thread_id=thread_id)
+        context_block = getattr(user_context, "context", "") or ""
+        if not isinstance(context_block, str):
+            context_block = str(context_block) if context_block is not None else ""
+
+        # 3) Harden retrieval by searching user-scoped edges (facts with validity ranges)
+        try:
+            facts = self.client.graph.search(
+                user_id=user_id,
+                query=cap_query(query),
+                scope="edges",
+                limit=20,
+            )
+            fact_text = render_graph_search(facts)
+        except Exception:
+            fact_text = ""
+
+        return _clean_long_term_context(context_block, fact_text)
 
     def retrieve_episodic(self, user_id: str, query: str) -> str:
-        # LAB TODO 2/4
-        # Use client.graph.search(user_id=..., query=cap_query(query),
-        #     scope="episodes", limit=...) then render_graph_search(...).
-        # Tip: verbose session episodes can crowd out concise, marker-bearing
-        # reflections under the tight episodic budget — render_graph_search
-        # accepts an `episode_char_cap` to keep more distinct episodes.
-        raise NotImplementedError("LAB TODO: implement episodic search")
+        # Search episodic graph scoped by user_id
+        results = self.client.graph.search(
+            user_id=user_id,
+            query=cap_query(query),
+            scope="episodes",
+            limit=20,
+        )
+
+        # Filter out evaluation probe messages and trivial echo acknowledgements
+        episodes = []
+        for ep in getattr(results, "episodes", []) or []:
+            role = (getattr(ep, "role", "") or "").strip()
+            if role == "Evaluation User":
+                continue
+            content = (getattr(ep, "content", "") or "").strip()
+            if role == "Lab Assistant" and len(content) < 90 and any(content.startswith(p) for p in ("Da hieu", "Da tach", "Toi se uu tien", "Noted")):
+                continue
+            episodes.append(ep)
+
+        class FilteredResult:
+            pass
+
+        res = FilteredResult()
+        res.episodes = episodes
+        for attr in ("context", "edges", "nodes", "observations", "thread_summaries"):
+            setattr(res, attr, getattr(results, attr, None))
+
+        return render_graph_search(res, episode_char_cap=180)
 
     def retrieve_semantic(self, graph_id: str, query: str) -> str:
-        # LAB TODO 3/4
-        # Search the standalone graph (graph_id, NOT user_id).
-        # Recommended: scope="episodes" — it returns raw document text that keeps
-        # literal markers (e.g. PAYMENT-RULE-3). The "auto" scope returns
-        # extracted facts that DROP those literal codes, so avoid it here.
-        # Fallback: scope="nodes".
-        raise NotImplementedError("LAB TODO: implement semantic graph search")
+        # Search the standalone semantic graph using graph_id
+        q = cap_query(query)
+        try:
+            results = self.client.graph.search(
+                graph_id=graph_id,
+                query=q,
+                scope="episodes",
+                limit=10,
+            )
+        except Exception:
+            # Fallback to scope="nodes" if episodes scope fails or is unsupported
+            results = self.client.graph.search(
+                graph_id=graph_id,
+                query=q,
+                scope="nodes",
+                limit=10,
+            )
+
+        # Deduplicate redundant JSON vs raw text representations of knowledge documents
+        seen = set()
+        clean_episodes = []
+        for ep in getattr(results, "episodes", []) or []:
+            content = (getattr(ep, "content", "") or "").strip()
+            if content.startswith("{") and '"summary":' in content:
+                continue
+            if content and content not in seen:
+                seen.add(content)
+                clean_episodes.append(ep)
+
+        class FilteredSemantic:
+            pass
+
+        res = FilteredSemantic()
+        res.episodes = clean_episodes
+        for attr in ("context", "edges", "nodes", "observations", "thread_summaries"):
+            setattr(res, attr, getattr(results, attr, None))
+
+        return render_graph_search(res)
 
     def assemble_context(self, layers: dict[str, str]) -> tuple[str, dict[str, dict[str, int]]]:
-        # LAB TODO 4/4
-        # Use ContextBudgetManager to enforce 10/4/3/3 budget and priority order.
-        raise NotImplementedError("LAB TODO: assemble/trim memory context")
+        return self.budget.assemble(layers)
